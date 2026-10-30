@@ -3,14 +3,11 @@ Food Analysis AI - inference API (Flask + LiteRT). Built to fit Render's Free in
 
 Endpoints
   GET  /health   -> {"status": "ok", "model_version": "...", "threshold": 0.3, ...}
-  POST /predict  -> header: X-API-Key: <key>
-                    body:   multipart/form-data, ONE file in field "image"
+  POST /predict  -> body:   multipart/form-data, ONE file in field "image"
                             (JPEG, PNG, WEBP, HEIC, MPO - max 15 MB, 32x32 to 24 MP)
-                 <- {"predicted_class": "Fresh" | "Rotten", "confidence": 0.9864,
-                     "rotten_probability": 0.0136, "threshold": 0.3, "is_rotten": false,
-                     "model_version": "...", "processing_ms": 210.5, "request_id": "..."}
+                 <- {"predicted_class": "Fresh" | "Rotten", "confidence": 0.9864}
   Errors         <- {"error": {"code": "...", "message": "..."}, "request_id": "..."}
-                    400 / 401 / 404 / 405 / 413 / 415 / 422 / 500 - always JSON, never a crash.
+                    400 / 404 / 405 / 413 / 415 / 422 / 500 - always JSON, never a crash.
   Every response carries an X-Request-ID header (sent by the client or generated here).
 
 Model (step 2 of deployment - step 1 is code/convert_model.py)
@@ -24,7 +21,6 @@ Contract (from the training notebook - do not change)
   Rotten if P >= threshold (0.30, from final_config.json); confidence = P if Rotten else 1 - P
 """
 import hashlib
-import hmac
 import io
 import json
 import logging
@@ -49,7 +45,6 @@ pillow_heif.register_heif_opener()  # iPhone HEIC photos
 
 # ---------------------------------------------------------------- settings
 MODEL_DIR = Path(os.getenv("MODEL_DIR", Path(__file__).resolve().parent.parent / "model"))
-API_KEY = os.getenv("API_KEY", "").strip()
 MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "15"))
 # 24 MP covers normal phone photos (12 MP / 24 MP) and keeps peak RAM well under 512 MB.
 MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", "24000000"))
@@ -62,9 +57,6 @@ EXIF_TRANSPOSE = {
     6: Image.Transpose.ROTATE_270, 7: Image.Transpose.TRANSVERSE, 8: Image.Transpose.ROTATE_90,
 }
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
-
-if not API_KEY:
-    raise RuntimeError("API_KEY environment variable is required.")
 
 CONFIG = json.loads((MODEL_DIR / "final_config.json").read_text(encoding="utf-8"))
 if CONFIG.get("label_map") != {"Fresh": 0, "Rotten": 1}:
@@ -269,9 +261,6 @@ def health():
 
 @app.post("/predict")
 def predict():
-    if not hmac.compare_digest(request.headers.get("X-API-Key", "").encode(), API_KEY.encode()):
-        raise APIError(401, "unauthorized", "Missing or invalid X-API-Key header.")
-
     started = time.perf_counter()
     upload = read_upload_stream()
     # One photo at a time: keeps peak memory low on a 512 MB instance.
@@ -285,12 +274,10 @@ def predict():
         raise APIError(500, "invalid_model_output", "Model returned an invalid value.")
 
     result = build_result(probability)
-    result["model_version"] = MODEL_VERSION
-    result["processing_ms"] = round((time.perf_counter() - started) * 1000, 1)
-    result["request_id"] = g.request_id
+    processing_ms = round((time.perf_counter() - started) * 1000, 1)
     log.info("predict request_id=%s format=%s bytes=%d class=%s p_rotten=%.4f ms=%.1f", g.request_id,
-             image_format, len(data), result["predicted_class"], probability, result["processing_ms"])
-    return result
+             image_format, len(data), result["predicted_class"], probability, processing_ms)
+    return {"predicted_class": result["predicted_class"], "confidence": result["confidence"]}
 
 
 if __name__ == "__main__":  # local debugging only; production runs gunicorn (see Docker/Dockerfile)
