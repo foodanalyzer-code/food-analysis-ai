@@ -1,0 +1,31 @@
+{
+  "model_file": "EfficientNetB0_finetuned.keras",
+  "model_name": "EfficientNetB0_finetuned",
+  "threshold": 0.3,
+  "image_size": [
+    224,
+    224
+  ],
+  "label_map": {
+    "Fresh": 0,
+    "Rotten": 1
+  },
+  "class_names": [
+    "Fresh",
+    "Rotten"
+  ],
+  "preprocessing": {
+    "color_mode": "RGB",
+    "rescale": "1/255.0",
+    "interpolation": "bilinear"
+  },
+  "selection_metric": "Validation Macro F1, then Rotten Recall",
+  "baseline_model": "EfficientNetB0",
+  "baseline_threshold": 0.46,
+  "fine_threshold": 0.3,
+  "test_accuracy": 0.9821580288870009,
+  "test_macro_f1": 0.9821352809589718,
+  "test_rotten_recall": 0.9789103690685413,
+  "test_roc_auc": 0.9980401905466654,
+  "test_pr_auc": 0.9981105321544887
+}
