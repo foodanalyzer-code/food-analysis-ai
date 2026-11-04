@@ -1,25 +1,3 @@
-"""
-Food Analysis AI - inference API (Flask + LiteRT). Built to fit Render's Free instance (512 MB).
-
-Endpoints
-  GET  /health   -> {"status": "ok", "model_version": "...", "threshold": 0.3, ...}
-  POST /predict  -> body:   multipart/form-data, ONE file in field "image"
-                            (JPEG, PNG, WEBP, HEIC, MPO - max 15 MB, 32x32 to 24 MP)
-                 <- {"predicted_class": "Fresh" | "Rotten", "confidence": 0.9864}
-  Errors         <- {"error": {"code": "...", "message": "..."}, "request_id": "..."}
-                    400 / 404 / 405 / 413 / 415 / 422 / 500 - always JSON, never a crash.
-  Every response carries an X-Request-ID header (sent by the client or generated here).
-
-Model (step 2 of deployment - step 1 is code/convert_model.py)
-  The Docker build converts the notebook's EfficientNetB0_finetuned.keras into food_model.tflite
-  (same float32 weights, training=False) and verifies it against the original. This server
-  only loads that verified file plus conversion_report.json, and runs it with LiteRT
-  (~0.12 GB RAM instead of ~0.8 GB for TensorFlow).
-
-Contract (from the training notebook - do not change)
-  RGB -> resize 224x224 (PIL BILINEAR) -> float32 / 255 -> model -> sigmoid = P(Rotten)
-  Rotten if P >= threshold (0.30, from final_config.json); confidence = P if Rotten else 1 - P
-"""
 import hashlib
 import io
 import json
@@ -31,7 +9,6 @@ import threading
 import time
 import uuid
 from pathlib import Path
-
 import numpy as np
 import pillow_heif
 from ai_edge_litert.interpreter import Interpreter
@@ -43,8 +20,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("food-ai")
 pillow_heif.register_heif_opener()  # iPhone HEIC photos
 
-# ---------------------------------------------------------------- settings
-MODEL_DIR = Path(os.getenv("MODEL_DIR", Path(__file__).resolve().parent.parent / "model"))
+MODEL_DIR = Path(os.getenv("MODEL_DIR", Path(__file__).resolve().parent))
 MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "15"))
 # 24 MP covers normal phone photos (12 MP / 24 MP) and keeps peak RAM well under 512 MB.
 MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", "24000000"))
@@ -76,10 +52,10 @@ if hashlib.sha256(MODEL_PATH.read_bytes()).hexdigest() != REPORT["tflite_sha256"
 MODEL_VERSION = f"{CONFIG['model_name']}@{REPORT['source_sha256'][:12]}"
 
 
-# ---------------------------------------------------------------- model
+# loads the model once
 class Model:
-    """LiteRT interpreter + a lock (an interpreter must not be used by two threads at once)."""
 
+    # load and sanity check
     def __init__(self, path: Path):
         started = time.perf_counter()
         self._interpreter = Interpreter(model_path=str(path), num_threads=1)
@@ -97,6 +73,7 @@ class Model:
         log.info("Model %s loaded and self-check passed in %.1fs (threshold=%.2f)",
                  MODEL_VERSION, time.perf_counter() - started, THRESHOLD)
 
+    # how rotten it looks
     def rotten_probability(self, batch: np.ndarray) -> float:
         self._interpreter.set_tensor(self._input, batch)
         self._interpreter.invoke()
@@ -106,15 +83,16 @@ class Model:
 MODEL = Model(MODEL_PATH)
 
 
-# ---------------------------------------------------------------- validation + preprocessing
+# our friendly errors
 class APIError(Exception):
+    # keep error details
     def __init__(self, status, code, message):
         super().__init__(message)
         self.status, self.code, self.message = status, code, message
 
 
+# grab the uploaded photo
 def read_upload_stream():
-    """Validate the multipart request and return the single uploaded file (not read yet)."""
     if request.mimetype != "multipart/form-data":
         raise APIError(400, "not_multipart",
                        "Send the request as multipart/form-data (Postman: Body -> form-data) "
@@ -134,8 +112,8 @@ def read_upload_stream():
     return files[0]
 
 
+# make colors normal RGB
 def to_rgb(img: Image.Image) -> Image.Image:
-    """Any supported colour mode -> 8-bit RGB. Plain RGB images are left untouched (notebook path)."""
     if img.mode == "RGB":
         return img
     if img.mode in ("I;16", "I;16B", "I;16L", "I"):  # 16-bit grayscale PNG: scale, don't clip
@@ -144,8 +122,8 @@ def to_rgb(img: Image.Image) -> Image.Image:
     return img.convert("RGB")  # RGBA, P, L, LA, CMYK, 1, ...
 
 
+# photo ready for model
 def preprocess(data: bytes):
-    """Exact notebook pipeline for normal photos. Only addition: EXIF rotation for phone photos."""
     try:
         img = Image.open(io.BytesIO(data))
     except Image.DecompressionBombError:
@@ -177,9 +155,7 @@ def preprocess(data: bytes):
     try:
         img = to_rgb(img)
         img = img.resize((IMAGE_W, IMAGE_H), Image.Resampling.BILINEAR)
-        # Phone EXIF rotation, applied to the small 224x224 image (no full-size copy).
-        # Same mapping as PIL.ImageOps.exif_transpose; the output is square, so the result
-        # matches rotating first. Photos without an EXIF orientation are untouched.
+       
         if orientation in EXIF_TRANSPOSE:
             img = img.transpose(EXIF_TRANSPOSE[orientation])
         batch = np.asarray(img, dtype=np.float32)[np.newaxis, ...] / 255.0
@@ -191,64 +167,68 @@ def preprocess(data: bytes):
     return batch, image_format
 
 
+# fresh or rotten?
 def build_result(rotten_probability: float) -> dict:
-    """Same decision logic as predict_image() in the notebook (section 6.14)."""
     is_rotten = rotten_probability >= THRESHOLD
     confidence = rotten_probability if is_rotten else 1.0 - rotten_probability
     return {
         "predicted_class": "Rotten" if is_rotten else "Fresh",
         "confidence": round(confidence, 4),
-        "rotten_probability": round(rotten_probability, 4),
-        "threshold": round(THRESHOLD, 4),
-        "is_rotten": bool(is_rotten),
     }
 
 
-# ---------------------------------------------------------------- HTTP
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = int(MAX_UPLOAD_MB * 1024 * 1024)
 app.json.sort_keys = False
 
 
+# tag every request
 @app.before_request
 def assign_request_id():
     incoming = request.headers.get("X-Request-ID", "")
     g.request_id = incoming if REQUEST_ID_PATTERN.match(incoming) else uuid.uuid4().hex
 
 
+# send the tag back
 @app.after_request
 def add_request_id_header(response):
     response.headers["X-Request-ID"] = getattr(g, "request_id", "")
     return response
 
 
+# one error shape
 def error(code, message, status):
     request_id = getattr(g, "request_id", None)
     log.warning("rejected request_id=%s status=%d code=%s", request_id, status, code)
     return jsonify({"error": {"code": code, "message": message}, "request_id": request_id}), status
 
 
+# our own errors
 @app.errorhandler(APIError)
 def handle_api_error(err):
     return error(err.code, err.message, err.status)
 
 
+# file too big
 @app.errorhandler(RequestEntityTooLarge)
 def handle_too_large(_err):
     return error("file_too_large", f"Upload exceeds {MAX_UPLOAD_MB:g} MB.", 413)
 
 
+# wrong url or method
 @app.errorhandler(HTTPException)
 def handle_http(err):
     return error((err.name or "http_error").lower().replace(" ", "_"), err.description, err.code)
 
 
+# anything unexpected, no crash
 @app.errorhandler(Exception)
 def handle_unexpected(_err):
     log.exception("Unhandled error request_id=%s", getattr(g, "request_id", None))
     return error("internal_error", "Unexpected server error. Quote the request_id when reporting it.", 500)
 
 
+# is the server alive
 @app.get("/health")
 def health():
     return {
@@ -259,6 +239,7 @@ def health():
     }
 
 
+# the main endpoint
 @app.post("/predict")
 def predict():
     started = time.perf_counter()
@@ -277,8 +258,8 @@ def predict():
     processing_ms = round((time.perf_counter() - started) * 1000, 1)
     log.info("predict request_id=%s format=%s bytes=%d class=%s p_rotten=%.4f ms=%.1f", g.request_id,
              image_format, len(data), result["predicted_class"], probability, processing_ms)
-    return {"predicted_class": result["predicted_class"], "confidence": result["confidence"]}
+    return result
 
 
-if __name__ == "__main__":  # local debugging only; production runs gunicorn (see Docker/Dockerfile)
+if __name__ == "__main__":  # local debugging only; production runs gunicorn (see Dockerfile)
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))

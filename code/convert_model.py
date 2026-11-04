@@ -9,17 +9,19 @@ import numpy as np
 import tensorflow as tf
 from ai_edge_litert.interpreter import Interpreter
 
-MODEL_DIR = Path(sys.argv[1] if len(sys.argv) > 1 else "model")
+MODEL_DIR = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
 OUT_DIR = Path(sys.argv[2] if len(sys.argv) > 2 else ".")
 MAX_ALLOWED_DIFF = 1e-4      # tolerance on the Rotten probability
 N_RANDOM, N_SMOOTH = 40, 40  # verification inputs
 PROBE_SEED = 0               # the same probe is re-checked by app.py at every server start
 
 
+# file fingerprint
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+# fake test images
 def verification_inputs(height: int, width: int) -> np.ndarray:
     """Deterministic inputs in [0, 1]: noise images and smooth colour images."""
     rng = np.random.default_rng(42)
@@ -31,6 +33,7 @@ def verification_inputs(height: int, width: int) -> np.ndarray:
     return np.concatenate([noise, np.stack(smooth)]).astype(np.float32)
 
 
+# convert then double-check
 def main() -> None:
     config = json.loads((MODEL_DIR / "final_config.json").read_text(encoding="utf-8"))
     source = MODEL_DIR / config["model_file"]
@@ -43,6 +46,7 @@ def main() -> None:
 
     print("[2/4] Converting to TFLite (float32, no quantization, training=False)")
 
+    # prediction only, no training
     @tf.function(input_signature=[tf.TensorSpec([1, height, width, 3], tf.float32, name="normalized_rgb")])
     def serve(x):
         return {"rotten_probability": model(x, training=False)}  # augmentation layers off
@@ -64,6 +68,7 @@ def main() -> None:
     in_idx = interpreter.get_input_details()[0]["index"]
     out_idx = interpreter.get_output_details()[0]["index"]
 
+    # ask the small model
     def run_tflite(x: np.ndarray) -> float:
         interpreter.set_tensor(in_idx, x[np.newaxis])
         interpreter.invoke()

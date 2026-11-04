@@ -1,4 +1,3 @@
-# Server (step 2) - pinned. The server needs no TensorFlow: LiteRT runs the converted model.
 ai-edge-litert==2.3.0
 numpy==2.1.3
 pillow==11.3.0
