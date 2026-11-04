@@ -1,0 +1,2 @@
+API_URL:https://food-analysis-ai-nyt6.onrender.com/predict
+REPO_URL:https://github.com/foodanalyzer-code/food-analysis-ai
