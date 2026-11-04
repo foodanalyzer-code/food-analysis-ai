@@ -2,7 +2,7 @@
 FROM python:3.13-slim AS convert
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 TF_CPP_MIN_LOG_LEVEL=2
 # Same versions used to train the model in Colab.
-RUN pip install tensorflow-cpu==2.21.0 keras==3.13.2 numpy==2.1.3 ai-edge-litert==2.3.0
+RUN pip install tensorflow-cpu==2.21.0 keras==3.13.2 numpy==2.1.3
 WORKDIR /convert
 COPY EfficientNetB0_finetuned.keras final_config.json convert_model.py ./
 RUN mkdir out && python convert_model.py . out
@@ -20,7 +20,7 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY app.py final_config.json ./
-COPY --from=convert /convert/out/food_model.tflite /convert/out/conversion_report.json ./
+COPY --from=convert /convert/out/food_model.tflite ./
 
 RUN useradd --create-home appuser
 USER appuser

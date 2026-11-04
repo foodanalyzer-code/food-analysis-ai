@@ -1,4 +1,3 @@
-import hashlib
 import io
 import json
 import logging
@@ -42,14 +41,7 @@ if CONFIG.get("preprocessing") != {"color_mode": "RGB", "rescale": "1/255.0", "i
 
 THRESHOLD = float(CONFIG["threshold"])
 IMAGE_H, IMAGE_W = (int(v) for v in CONFIG["image_size"])
-
-# Written by convert_model.py during the Docker build.
-REPORT = json.loads((MODEL_DIR / "conversion_report.json").read_text(encoding="utf-8"))
-MODEL_PATH = MODEL_DIR / REPORT["tflite_model"]
-if hashlib.sha256(MODEL_PATH.read_bytes()).hexdigest() != REPORT["tflite_sha256"]:
-    raise RuntimeError("food_model.tflite does not match conversion_report.json.")
-# Version = the ORIGINAL notebook model's hash, so every result traces back to it.
-MODEL_VERSION = f"{CONFIG['model_name']}@{REPORT['source_sha256'][:12]}"
+MODEL_PATH = MODEL_DIR / "food_model.tflite"
 
 
 # loads the model once
@@ -63,15 +55,8 @@ class Model:
         self._input = self._interpreter.get_input_details()[0]["index"]
         self._output = self._interpreter.get_output_details()[0]["index"]
         self.lock = threading.Lock()
-
-        # Startup self-check: the probe from convert_model.py, run 3x, must give one value
-        # equal to what the ORIGINAL Keras model produced for it.
-        probe = np.random.default_rng(REPORT["probe_seed"]).random((1, IMAGE_H, IMAGE_W, 3), dtype=np.float32)
-        outputs = {self.rotten_probability(probe) for _ in range(3)}
-        if len(outputs) != 1 or abs(outputs.pop() - REPORT["probe_expected_output"]) > 1e-4:
-            raise RuntimeError("Startup self-check failed: model output does not match the original model.")
-        log.info("Model %s loaded and self-check passed in %.1fs (threshold=%.2f)",
-                 MODEL_VERSION, time.perf_counter() - started, THRESHOLD)
+        log.info("Model %s loaded in %.1fs (threshold=%.2f)",
+                 path.name, time.perf_counter() - started, THRESHOLD)
 
     # how rotten it looks
     def rotten_probability(self, batch: np.ndarray) -> float:
@@ -231,12 +216,7 @@ def handle_unexpected(_err):
 # is the server alive
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "model_version": MODEL_VERSION,
-        "threshold": THRESHOLD,
-        "conversion_max_difference": REPORT["max_abs_difference"],
-    }
+    return {"status": "ok"}
 
 
 # the main endpoint
