@@ -64,7 +64,7 @@ COOKED_OR_PACKAGING_LABELS = {
 
 UNSUPPORTED_IMAGENET_LABELS = {
     "pineapple", "broccoli", "cauliflower", "head_cabbage", "artichoke", "corn", "mushroom",
-    "acorn_squash", "butternut_squash", "zucchini"
+    "acorn_squash", "butternut_squash", "zucchini", "cardoon", "jackfruit"
 }
 
 PRODUCE_OR_ORGANIC_LABELS = {
@@ -128,11 +128,12 @@ class Gatekeeper:
         top1_prob = float(probs[int(top3_idx[0])])
         top3_labels = {self.labels[int(i)] for i in top3_idx}
 
-        if top1_label in UNSUPPORTED_IMAGENET_LABELS and top1_prob >= 0.35:
-            return ("unsupported_item", "This food item is not supported for automated analysis.", top1_prob)
+        for idx in top3_idx[:2]:
+            if self.labels[int(idx)] in UNSUPPORTED_IMAGENET_LABELS and float(probs[int(idx)]) >= 0.15:
+                return ("unsupported_item", "This food item is not supported for automated analysis.", float(probs[int(idx)]))
         if top1_label in COOKED_OR_PACKAGING_LABELS and top1_prob >= 0.25:
             return ("not_food", "No fruit or vegetable recognized in the image. Please capture food clearly.", top1_prob)
-        if top1_prob >= 0.30 and not (top3_labels & PRODUCE_OR_ORGANIC_LABELS):
+        if top1_prob >= 0.25 and not (top3_labels & PRODUCE_OR_ORGANIC_LABELS):
             return ("not_food", "No fruit or vegetable recognized in the image. Please capture food clearly.", top1_prob)
         return None
 
@@ -397,11 +398,9 @@ def predict():
     confidence = rotten_prob if is_rotten else 1.0 - rotten_prob
 
     if UNCERTAIN_LOW <= rotten_prob <= UNCERTAIN_HIGH:
-        cond_label = "Fresh" if rotten_prob < 0.50 else "Rotten"
-        pct = round(max(rotten_prob, 1.0 - rotten_prob) * 100)
         return jsonify({
             "code": "uncertain",
-            "message": f"Inconclusive result - {cond_label} {pct}%.",
+            "message": f"Inconclusive result - {predicted_class} ({round(confidence * 100)}%). Needs manual review.",
             "predicted_class": predicted_class,
             "confidence": round(confidence, 4),
             "detected_food": detected_food_en,
