@@ -1,0 +1,37 @@
+{
+  "model_file": "food_model_dual.tflite",
+  "model_name": "EfficientNetB0_dualhead",
+  "image_size": [
+    224,
+    224
+  ],
+  "condition_threshold": 0.3,
+  "ood_food_threshold": 0.65,
+  "uncertainty_range": [
+    0.35,
+    0.65
+  ],
+  "food_classes": [
+    "Apple",
+    "Banana",
+    "Mango",
+    "Orange",
+    "Strawberry"
+  ],
+  "food_to_id": {
+    "Apple": 0,
+    "Banana": 1,
+    "Mango": 2,
+    "Orange": 3,
+    "Strawberry": 4
+  },
+  "condition_classes": [
+    "Fresh",
+    "Rotten"
+  ],
+  "preprocessing": {
+    "color_mode": "RGB",
+    "rescale": "1/255.0",
+    "interpolation": "bilinear"
+  }
+}
