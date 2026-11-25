@@ -411,6 +411,7 @@ def predict():
         "predicted_class": predicted_class,
         "confidence": round(confidence, 4),
         "detected_food": detected_food_en,
+        "message": f"Recognized as {detected_food_en} and it is {predicted_class}.",
     }
     if is_mixed_batch:
         response_payload["warning"] = "Mixed conditions detected across batch. Sorting recommended before final approval."
