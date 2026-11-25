@@ -411,7 +411,7 @@ def predict():
         "predicted_class": predicted_class,
         "confidence": round(confidence, 4),
         "detected_food": detected_food_en,
-        "message": "Redirected to organic farm" if is_rotten else "Food is safe",
+        "message": "Redirected to organic farm (rotten)" if is_rotten else "Food is safe ( fresh )",
     }
     if is_mixed_batch:
         response_payload["warning"] = "Mixed conditions detected across batch. Sorting recommended before final approval."
