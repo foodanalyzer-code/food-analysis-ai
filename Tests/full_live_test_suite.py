@@ -103,7 +103,7 @@ record("TC-06", "Cooked or processed food", "Fries image + declared 'بطاطس 
 PROCESSED_HASHES.clear()
 res07 = client.post("/predict", data={"image": (io.BytesIO(real_banana_bytes), "fruit.jpg"), "declared_item": "تفاح"}, content_type="multipart/form-data")
 j07 = res07.get_json() or {}
-record("TC-07", "Declared item mismatch", "Banana image + declared 'تفاح'", "HIGH", "Mismatch", j07.get("message", ""), j07.get("code") == "mismatch")
+record("TC-07", "Declared item mismatch", "Banana image + declared 'تفاح'", "HIGH", "Alert + Fresh/Rotten", f"{j07.get('predicted_class')} | {j07.get('alert', '')}", "alert" in j07 and "predicted_class" in j07)
 
 PROCESSED_HASHES.clear()
 res08 = client.post("/predict", data={"image": (io.BytesIO(generate_packaged_orange()), "pkg.jpg"), "in_packaging": "true"}, content_type="multipart/form-data")

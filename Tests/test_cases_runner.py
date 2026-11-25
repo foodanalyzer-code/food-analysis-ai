@@ -78,7 +78,7 @@ record("TC-17", "Duplicate image", "CRITICAL", json_17.get("message", ""), res_t
 PROCESSED_HASHES.clear()
 res_tc07 = client.post("/predict", data={"image": (load_real_sample("freshBanana (6).jpg"), "b.jpg"), "declared_item": "Apple"}, content_type="multipart/form-data")
 json_07 = res_tc07.get_json() or {}
-record("TC-07", "Item mismatch", "HIGH", json_07.get("message", ""), json_07.get("code") == "mismatch")
+record("TC-07", "Item mismatch", "HIGH", f"{json_07.get('predicted_class')} | {json_07.get('alert', '')}", "alert" in json_07 and "predicted_class" in json_07)
 
 print("\n" + "=" * 95)
 print(f"{'TC ID':<8} | {'Scenario':<25} | {'Priority':<8} | {'Status':<6} | {'Actual Response'}")

@@ -438,16 +438,11 @@ def predict():
             "confidence": round(food_conf, 4),
         })
 
+    mismatch_alert = None
     if declared_food and detected_food_en:
         declared_norm_en = AR_TO_EN_FOOD.get(declared_food.strip().lower(), declared_food.strip().capitalize())
         if declared_norm_en != detected_food_en:
-            return jsonify({
-                "code": "mismatch",
-                "message": "Food item in image does not match the declared order item.",
-                "declared_item": declared_food,
-                "detected_item": detected_food_en,
-                "confidence": round(food_conf, 4),
-            })
+            mismatch_alert = "Food item in image does not match the declared order item."
 
     is_rotten = rotten_prob >= THRESHOLD
     predicted_class = "Rotten" if is_rotten else "Fresh"
@@ -456,17 +451,22 @@ def predict():
     if UNCERTAIN_LOW <= rotten_prob <= UNCERTAIN_HIGH:
         cond_label = "Fresh" if rotten_prob < 0.50 else "Rotten"
         pct = round(max(rotten_prob, 1.0 - rotten_prob) * 100)
-        return jsonify({
+        uncertain_payload = {
             "code": "uncertain",
             "message": f"Inconclusive result - {cond_label} {pct}%.",
             "predicted_class": predicted_class,
             "confidence": round(confidence, 4),
-        })
+        }
+        if mismatch_alert:
+            uncertain_payload["alert"] = mismatch_alert
+        return jsonify(uncertain_payload)
 
     response_payload = {
         "predicted_class": predicted_class,
         "confidence": round(confidence, 4),
     }
+    if mismatch_alert:
+        response_payload["alert"] = mismatch_alert
     if is_mixed_batch:
         response_payload["warning"] = "Mixed conditions detected across batch. Sorting recommended before final approval."
     return jsonify(response_payload)
