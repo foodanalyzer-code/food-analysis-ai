@@ -9,7 +9,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY app.py final_config_dual.json food_model_dual.tflite final_config.json ./
+COPY app.py final_config_dual.json food_model_dual.tflite gatekeeper_model.tflite imagenet_classes.json final_config.json ./
 
 RUN useradd --create-home appuser
 USER appuser

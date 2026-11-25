@@ -77,6 +77,29 @@ COOKED_OR_PROCESSED_ITEMS = {
     "rice", "french fries", "fries", "juice", "orange juice", "cooked", "pasta"
 }
 
+COOKED_IMAGENET_LABELS = {
+    "pizza", "cheeseburger", "hotdog", "French_loaf", "bagel", "pretzel", "mashed_potato",
+    "guacamole", "consomme", "hot_pot", "trifle", "ice_cream", "ice_lolly", "burrito",
+    "potpie", "meat_loaf", "carbonara", "chocolate_sauce", "espresso", "soup_bowl", "plate", "bakery"
+}
+
+PACKAGING_IMAGENET_LABELS = {
+    "plastic_bag", "shopping_basket", "shopping_cart", "crate", "carton", "packet", "envelope", "mailbag", "hamper"
+}
+
+UNSUPPORTED_IMAGENET_LABELS = {
+    "pineapple", "broccoli", "cauliflower", "head_cabbage", "artichoke", "corn", "mushroom",
+    "acorn_squash", "butternut_squash", "zucchini"
+}
+
+PRODUCE_OR_ORGANIC_LABELS = {
+    "Granny_Smith", "banana", "orange", "lemon", "strawberry", "bell_pepper", "cucumber",
+    "pomegranate", "fig", "pineapple", "custard_apple", "jackfruit", "spaghetti_squash",
+    "butternut_squash", "acorn_squash", "zucchini", "broccoli", "cauliflower", "head_cabbage",
+    "artichoke", "corn", "mushroom", "buckeye", "acorn", "hip", "croquet_ball",
+    "ping-pong_ball", "tennis_ball", "grocery_store", "maraca", "rapeseed", "ear"
+}
+
 dual_config_path = BASE_DIR / "final_config_dual.json"
 legacy_config_path = BASE_DIR / "final_config.json"
 
@@ -87,7 +110,7 @@ if dual_config_path.is_file():
     FOOD_CLASSES = CONFIG.get("food_classes", ["Apple", "Banana", "Mango", "Orange", "Strawberry"])
     FOOD_TO_ID = CONFIG.get("food_to_id", {name: idx for idx, name in enumerate(FOOD_CLASSES)})
     ID_TO_FOOD = {idx: name for name, idx in FOOD_TO_ID.items()}
-    OOD_FOOD_THRESHOLD = float(CONFIG.get("ood_food_threshold", 0.65))
+    OOD_FOOD_THRESHOLD = float(CONFIG.get("ood_food_threshold", 0.45))
     THRESHOLD = float(CONFIG.get("condition_threshold", 0.30))
     UNCERTAIN_LOW = float(CONFIG.get("uncertainty_range", [0.35, 0.65])[0])
     UNCERTAIN_HIGH = float(CONFIG.get("uncertainty_range", [0.35, 0.65])[1])
@@ -98,12 +121,47 @@ else:
     FOOD_CLASSES = []
     FOOD_TO_ID = {}
     ID_TO_FOOD = {}
-    OOD_FOOD_THRESHOLD = 0.65
+    OOD_FOOD_THRESHOLD = 0.45
     THRESHOLD = float(CONFIG.get("threshold", 0.30))
     UNCERTAIN_LOW = 0.35
     UNCERTAIN_HIGH = 0.65
 
 IMAGE_H, IMAGE_W = (int(v) for v in CONFIG["image_size"])
+
+
+class Gatekeeper:
+    def __init__(self, model_path: Path, labels_path: Path):
+        self.enabled = model_path.is_file() and labels_path.is_file()
+        self.lock = threading.Lock()
+        if self.enabled:
+            self.labels = json.loads(labels_path.read_text(encoding="utf-8"))
+            self._interpreter = Interpreter(model_path=str(model_path), num_threads=1)
+            self._interpreter.allocate_tensors()
+            self._input = self._interpreter.get_input_details()[0]["index"]
+            self._output = self._interpreter.get_output_details()[0]["index"]
+            log.info("Gatekeeper %s loaded (%d classes)", model_path.name, len(self.labels))
+
+    def check(self, batch: np.ndarray):
+        if not self.enabled:
+            return None
+        with self.lock:
+            self._interpreter.set_tensor(self._input, batch)
+            self._interpreter.invoke()
+            probs = self._interpreter.get_tensor(self._output)[0]
+        top3_idx = np.argsort(probs)[::-1][:3]
+        top1_label = self.labels[int(top3_idx[0])]
+        top1_prob = float(probs[int(top3_idx[0])])
+        top3_labels = {self.labels[int(i)] for i in top3_idx}
+
+        if top1_label in COOKED_IMAGENET_LABELS and top1_prob >= 0.25:
+            return ("cooked_or_processed", "System is dedicated for fresh, uncooked fruits and vegetables only.", top1_prob)
+        if top1_label in PACKAGING_IMAGENET_LABELS and top1_prob >= 0.25:
+            return ("packaging_detected", "Please remove the food item from packaging and retake the photo.", top1_prob)
+        if top1_label in UNSUPPORTED_IMAGENET_LABELS and top1_prob >= 0.35:
+            return ("unsupported_item", "This food item is not supported for automated analysis.", top1_prob)
+        if top1_prob >= 0.30 and not (top3_labels & PRODUCE_OR_ORGANIC_LABELS):
+            return ("not_food", "No fruit or vegetable recognized in the image. Please capture food clearly.", top1_prob)
+        return None
 
 
 class Model:
@@ -112,10 +170,10 @@ class Model:
         self._interpreter = Interpreter(model_path=str(path), num_threads=1)
         self._interpreter.allocate_tensors()
         self._input = self._interpreter.get_input_details()[0]["index"]
-        
+
         output_details = self._interpreter.get_output_details()
         self.is_dual = len(output_details) > 1
-        
+
         if self.is_dual:
             for out in output_details:
                 shape = out["shape"]
@@ -142,6 +200,7 @@ class Model:
         return food_probs, cond_prob
 
 
+GATEKEEPER = Gatekeeper(BASE_DIR / "gatekeeper_model.tflite", BASE_DIR / "imagenet_classes.json")
 MODEL = Model(MODEL_PATH)
 
 
@@ -297,6 +356,7 @@ def health():
         "status": "ok",
         "model_name": CONFIG.get("model_name", "food_model"),
         "dual_head": MODEL.is_dual,
+        "gatekeeper": GATEKEEPER.enabled,
         "supported_foods": FOOD_CLASSES,
         "service_status": "OPERATIONAL",
     }
@@ -313,7 +373,6 @@ def sync_offline():
 
 @app.post("/predict")
 def predict():
-    started = time.perf_counter()
     upload = read_upload_stream()
     declared_food = request.form.get("declared_item") or request.form.get("food_type") or request.form.get("declared_food")
     in_packaging = request.form.get("in_packaging", "false").lower() in ("true", "1")
@@ -348,7 +407,17 @@ def predict():
             raise APIError(409, "duplicate_image", "This image has already been used in another request.")
         PROCESSED_HASHES.add(img_hash)
 
-    batch, image_format = preprocess(data, upload.filename or "")
+    batch, _ = preprocess(data, upload.filename or "")
+
+    gk_verdict = GATEKEEPER.check(batch)
+    if gk_verdict is not None:
+        gk_code, gk_msg, gk_conf = gk_verdict
+        return jsonify({
+            "code": gk_code,
+            "message": gk_msg,
+            "confidence": round(gk_conf, 4),
+        })
+
     food_probs, rotten_prob = MODEL.infer(batch)
 
     if not math.isfinite(rotten_prob) or not 0.0 <= rotten_prob <= 1.0:
