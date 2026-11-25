@@ -55,35 +55,10 @@ REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 PROCESSED_HASHES = set()
 HASH_LOCK = threading.Lock()
 
-AR_TO_EN_FOOD = {
-    "تفاح": "Apple", "تفاحة": "Apple", "apple": "Apple",
-    "موز": "Banana", "موزة": "Banana", "banana": "Banana",
-    "فلفل": "Bellpepper", "فلفل رومي": "Bellpepper", "bellpepper": "Bellpepper",
-    "جزر": "Carrot", "جزرة": "Carrot", "carrot": "Carrot",
-    "خيار": "Cucumber", "خيارة": "Cucumber", "cucumber": "Cucumber",
-    "مانجو": "Mango", "مانجا": "Mango", "mango": "Mango",
-    "برتقال": "Orange", "برتقالة": "Orange", "orange": "Orange",
-    "بطاطس": "Potato", "بطاطا": "Potato", "potato": "Potato",
-    "فراولة": "Strawberry", "strawberry": "Strawberry",
-    "طماطم": "Tomato", "طماطماية": "Tomato", "بندورة": "Tomato", "tomato": "Tomato",
-}
-
-UNSUPPORTED_FOOD_ITEMS = {
-    "عنب", "بطيخ", "خس", "رمان", "خوخ", "مشمش", "تين", "كمثرى", "grapes", "watermelon", "lettuce", "peach", "pear"
-}
-
-COOKED_OR_PROCESSED_ITEMS = {
-    "أرز", "رز", "بطاطس مقلية", "بطاطا مقلية", "عصير", "عصير برتقال", "شيبس", "معكرونة", "مكرونة", "طبيخ", "مطبوخ",
-    "rice", "french fries", "fries", "juice", "orange juice", "cooked", "pasta"
-}
-
-COOKED_IMAGENET_LABELS = {
+COOKED_OR_PACKAGING_LABELS = {
     "pizza", "cheeseburger", "hotdog", "French_loaf", "bagel", "pretzel", "mashed_potato",
     "guacamole", "consomme", "hot_pot", "trifle", "ice_cream", "ice_lolly", "burrito",
-    "potpie", "meat_loaf", "carbonara", "chocolate_sauce", "espresso", "soup_bowl", "plate", "bakery"
-}
-
-PACKAGING_IMAGENET_LABELS = {
+    "potpie", "meat_loaf", "carbonara", "chocolate_sauce", "espresso", "soup_bowl", "plate", "bakery",
     "plastic_bag", "shopping_basket", "shopping_cart", "crate", "carton", "packet", "envelope", "mailbag", "hamper"
 }
 
@@ -153,12 +128,10 @@ class Gatekeeper:
         top1_prob = float(probs[int(top3_idx[0])])
         top3_labels = {self.labels[int(i)] for i in top3_idx}
 
-        if top1_label in COOKED_IMAGENET_LABELS and top1_prob >= 0.25:
-            return ("cooked_or_processed", "System is dedicated for fresh, uncooked fruits and vegetables only.", top1_prob)
-        if top1_label in PACKAGING_IMAGENET_LABELS and top1_prob >= 0.25:
-            return ("packaging_detected", "Please remove the food item from packaging and retake the photo.", top1_prob)
         if top1_label in UNSUPPORTED_IMAGENET_LABELS and top1_prob >= 0.35:
             return ("unsupported_item", "This food item is not supported for automated analysis.", top1_prob)
+        if top1_label in COOKED_OR_PACKAGING_LABELS and top1_prob >= 0.25:
+            return ("not_food", "No fruit or vegetable recognized in the image. Please capture food clearly.", top1_prob)
         if top1_prob >= 0.30 and not (top3_labels & PRODUCE_OR_ORGANIC_LABELS):
             return ("not_food", "No fruit or vegetable recognized in the image. Please capture food clearly.", top1_prob)
         return None
@@ -374,32 +347,11 @@ def sync_offline():
 @app.post("/predict")
 def predict():
     upload = read_upload_stream()
-    declared_food = request.form.get("declared_item") or request.form.get("food_type") or request.form.get("declared_food")
-    in_packaging = request.form.get("in_packaging", "false").lower() in ("true", "1")
     is_mixed_batch = request.form.get("mixed_batch", "false").lower() in ("true", "1")
 
     data = upload.read()
     if not data:
         raise APIError(400, "missing_image", "Food image is required before confirming receipt.")
-
-    if in_packaging:
-        return jsonify({
-            "code": "packaging_detected",
-            "message": "Please remove the food item from packaging and retake the photo.",
-        })
-
-    if declared_food:
-        declared_clean = declared_food.strip().lower()
-        if declared_clean in COOKED_OR_PROCESSED_ITEMS:
-            return jsonify({
-                "code": "cooked_or_processed",
-                "message": "System is dedicated for fresh, uncooked fruits and vegetables only.",
-            })
-        if declared_clean in UNSUPPORTED_FOOD_ITEMS:
-            return jsonify({
-                "code": "unsupported_item",
-                "message": "This food item is not supported for automated analysis.",
-            })
 
     img_hash = hashlib.sha256(data).hexdigest()
     with HASH_LOCK:
@@ -415,6 +367,7 @@ def predict():
         return jsonify({
             "code": gk_code,
             "message": gk_msg,
+            "detected_food": "Unknown",
             "confidence": round(gk_conf, 4),
         })
 
@@ -423,26 +376,21 @@ def predict():
     if not math.isfinite(rotten_prob) or not 0.0 <= rotten_prob <= 1.0:
         raise APIError(500, "invalid_model_output", "Analysis service returned an invalid result. Request has been queued.")
 
-    detected_food_en = None
+    detected_food_en = "Unknown"
     food_conf = 1.0
 
     if food_probs is not None and len(food_probs) > 0:
         top_idx = int(np.argmax(food_probs))
-        detected_food_en = ID_TO_FOOD.get(top_idx, f"Class_{top_idx}")
+        detected_food_en = ID_TO_FOOD.get(top_idx, "Unknown")
         food_conf = float(food_probs[top_idx])
 
     if food_probs is not None and food_conf < OOD_FOOD_THRESHOLD:
         return jsonify({
             "code": "not_food",
             "message": "No fruit or vegetable recognized in the image. Please capture food clearly.",
+            "detected_food": "Unknown",
             "confidence": round(food_conf, 4),
         })
-
-    mismatch_alert = None
-    if declared_food and detected_food_en:
-        declared_norm_en = AR_TO_EN_FOOD.get(declared_food.strip().lower(), declared_food.strip().capitalize())
-        if declared_norm_en != detected_food_en:
-            mismatch_alert = "Food item in image does not match the declared order item."
 
     is_rotten = rotten_prob >= THRESHOLD
     predicted_class = "Rotten" if is_rotten else "Fresh"
@@ -451,22 +399,19 @@ def predict():
     if UNCERTAIN_LOW <= rotten_prob <= UNCERTAIN_HIGH:
         cond_label = "Fresh" if rotten_prob < 0.50 else "Rotten"
         pct = round(max(rotten_prob, 1.0 - rotten_prob) * 100)
-        uncertain_payload = {
+        return jsonify({
             "code": "uncertain",
             "message": f"Inconclusive result - {cond_label} {pct}%.",
             "predicted_class": predicted_class,
             "confidence": round(confidence, 4),
-        }
-        if mismatch_alert:
-            uncertain_payload["alert"] = mismatch_alert
-        return jsonify(uncertain_payload)
+            "detected_food": detected_food_en,
+        })
 
     response_payload = {
         "predicted_class": predicted_class,
         "confidence": round(confidence, 4),
+        "detected_food": detected_food_en,
     }
-    if mismatch_alert:
-        response_payload["alert"] = mismatch_alert
     if is_mixed_batch:
         response_payload["warning"] = "Mixed conditions detected across batch. Sorting recommended before final approval."
     return jsonify(response_payload)
