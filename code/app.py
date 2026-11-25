@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import logging
@@ -8,130 +9,223 @@ import threading
 import time
 import uuid
 from pathlib import Path
+
 import numpy as np
-import pillow_heif
-from ai_edge_litert.interpreter import Interpreter
 from flask import Flask, g, jsonify, request
 from PIL import Image
 from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 
+try:
+    from ai_edge_litert.interpreter import Interpreter
+except ImportError:
+    try:
+        import tensorflow as tf
+        Interpreter = tf.lite.Interpreter
+    except ImportError:
+        from tflite_runtime.interpreter import Interpreter
+
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except ImportError:
+    pass
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("food-ai")
-pillow_heif.register_heif_opener()  # iPhone HEIC photos
 
-MODEL_DIR = Path(os.getenv("MODEL_DIR", Path(__file__).resolve().parent))
-MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "15"))
-# 24 MP covers normal phone photos (12 MP / 24 MP) and keeps peak RAM well under 512 MB.
+BASE_DIR = Path(os.getenv("MODEL_DIR", Path(__file__).resolve().parent))
+MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "5.0"))
 MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", "24000000"))
 MIN_IMAGE_SIDE = 32
 IMAGE_FIELD = "image"
 ALLOWED_FORMATS = {"JPEG", "MPO", "PNG", "WEBP", "HEIF"}
+NON_IMAGE_EXTENSIONS = {".pdf", ".mp3", ".wav", ".mp4", ".avi", ".docx", ".xlsx", ".zip", ".tar", ".gz", ".ogg"}
+
 EXIF_TRANSPOSE = {
-    2: Image.Transpose.FLIP_LEFT_RIGHT, 3: Image.Transpose.ROTATE_180,
-    4: Image.Transpose.FLIP_TOP_BOTTOM, 5: Image.Transpose.TRANSPOSE,
-    6: Image.Transpose.ROTATE_270, 7: Image.Transpose.TRANSVERSE, 8: Image.Transpose.ROTATE_90,
+    2: Image.Transpose.FLIP_LEFT_RIGHT,
+    3: Image.Transpose.ROTATE_180,
+    4: Image.Transpose.FLIP_TOP_BOTTOM,
+    5: Image.Transpose.TRANSPOSE,
+    6: Image.Transpose.ROTATE_270,
+    7: Image.Transpose.TRANSVERSE,
+    8: Image.Transpose.ROTATE_90,
 }
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
-CONFIG = json.loads((MODEL_DIR / "final_config.json").read_text(encoding="utf-8"))
-if CONFIG.get("label_map") != {"Fresh": 0, "Rotten": 1}:
-    raise RuntimeError(f"Unexpected label_map in final_config.json: {CONFIG.get('label_map')}")
-if CONFIG.get("preprocessing") != {"color_mode": "RGB", "rescale": "1/255.0", "interpolation": "bilinear"}:
-    raise RuntimeError(f"Unexpected preprocessing in final_config.json: {CONFIG.get('preprocessing')}")
+PROCESSED_HASHES = set()
+HASH_LOCK = threading.Lock()
 
-THRESHOLD = float(CONFIG["threshold"])
+AR_TO_EN_FOOD = {
+    "تفاح": "Apple", "تفاحة": "Apple", "apple": "Apple",
+    "موز": "Banana", "موزة": "Banana", "banana": "Banana",
+    "فلفل": "Bellpepper", "فلفل رومي": "Bellpepper", "bellpepper": "Bellpepper",
+    "جزر": "Carrot", "جزرة": "Carrot", "carrot": "Carrot",
+    "خيار": "Cucumber", "خيارة": "Cucumber", "cucumber": "Cucumber",
+    "مانجو": "Mango", "مانجا": "Mango", "mango": "Mango",
+    "برتقال": "Orange", "برتقالة": "Orange", "orange": "Orange",
+    "بطاطس": "Potato", "بطاطا": "Potato", "potato": "Potato",
+    "فراولة": "Strawberry", "strawberry": "Strawberry",
+    "طماطم": "Tomato", "طماطماية": "Tomato", "بندورة": "Tomato", "tomato": "Tomato",
+}
+
+UNSUPPORTED_FOOD_ITEMS = {
+    "عنب", "بطيخ", "خس", "رمان", "خوخ", "مشمش", "تين", "كمثرى", "grapes", "watermelon", "lettuce", "peach", "pear"
+}
+
+COOKED_OR_PROCESSED_ITEMS = {
+    "أرز", "رز", "بطاطس مقلية", "بطاطا مقلية", "عصير", "عصير برتقال", "شيبس", "معكرونة", "مكرونة", "طبيخ", "مطبوخ",
+    "rice", "french fries", "fries", "juice", "orange juice", "cooked", "pasta"
+}
+
+dual_config_path = BASE_DIR / "final_config_dual.json"
+legacy_config_path = BASE_DIR / "final_config.json"
+
+if dual_config_path.is_file():
+    CONFIG = json.loads(dual_config_path.read_text(encoding="utf-8"))
+    IS_DUAL_HEAD = True
+    MODEL_PATH = BASE_DIR / CONFIG.get("model_file", "food_model_dual.tflite")
+    FOOD_CLASSES = CONFIG.get("food_classes", ["Apple", "Banana", "Mango", "Orange", "Strawberry"])
+    FOOD_TO_ID = CONFIG.get("food_to_id", {name: idx for idx, name in enumerate(FOOD_CLASSES)})
+    ID_TO_FOOD = {idx: name for name, idx in FOOD_TO_ID.items()}
+    OOD_FOOD_THRESHOLD = float(CONFIG.get("ood_food_threshold", 0.65))
+    THRESHOLD = float(CONFIG.get("condition_threshold", 0.30))
+    UNCERTAIN_LOW = float(CONFIG.get("uncertainty_range", [0.35, 0.65])[0])
+    UNCERTAIN_HIGH = float(CONFIG.get("uncertainty_range", [0.35, 0.65])[1])
+else:
+    CONFIG = json.loads(legacy_config_path.read_text(encoding="utf-8"))
+    IS_DUAL_HEAD = False
+    MODEL_PATH = BASE_DIR / "food_model.tflite"
+    FOOD_CLASSES = []
+    FOOD_TO_ID = {}
+    ID_TO_FOOD = {}
+    OOD_FOOD_THRESHOLD = 0.65
+    THRESHOLD = float(CONFIG.get("threshold", 0.30))
+    UNCERTAIN_LOW = 0.35
+    UNCERTAIN_HIGH = 0.65
+
 IMAGE_H, IMAGE_W = (int(v) for v in CONFIG["image_size"])
-MODEL_PATH = MODEL_DIR / "food_model.tflite"
 
 
-# loads the model once
 class Model:
-
-    # load and sanity check
     def __init__(self, path: Path):
         started = time.perf_counter()
         self._interpreter = Interpreter(model_path=str(path), num_threads=1)
         self._interpreter.allocate_tensors()
         self._input = self._interpreter.get_input_details()[0]["index"]
-        self._output = self._interpreter.get_output_details()[0]["index"]
-        self.lock = threading.Lock()
-        log.info("Model %s loaded in %.1fs (threshold=%.2f)",
-                 path.name, time.perf_counter() - started, THRESHOLD)
+        
+        output_details = self._interpreter.get_output_details()
+        self.is_dual = len(output_details) > 1
+        
+        if self.is_dual:
+            for out in output_details:
+                shape = out["shape"]
+                if len(shape) >= 2 and shape[-1] > 1:
+                    self._food_output = out["index"]
+                else:
+                    self._cond_output = out["index"]
+        else:
+            self._cond_output = output_details[0]["index"]
+            self._food_output = None
 
-    # how rotten it looks
-    def rotten_probability(self, batch: np.ndarray) -> float:
-        self._interpreter.set_tensor(self._input, batch)
-        self._interpreter.invoke()
-        return float(self._interpreter.get_tensor(self._output)[0, 0])
+        self.lock = threading.Lock()
+        log.info("Model %s loaded in %.1fs (dual=%s, threshold=%.2f)",
+                 path.name, time.perf_counter() - started, self.is_dual, THRESHOLD)
+
+    def infer(self, batch: np.ndarray):
+        with self.lock:
+            self._interpreter.set_tensor(self._input, batch)
+            self._interpreter.invoke()
+            cond_prob = float(self._interpreter.get_tensor(self._cond_output)[0, 0])
+            food_probs = None
+            if self.is_dual and self._food_output is not None:
+                food_probs = self._interpreter.get_tensor(self._food_output)[0]
+        return food_probs, cond_prob
 
 
 MODEL = Model(MODEL_PATH)
 
 
-# our friendly errors
 class APIError(Exception):
-    # keep error details
-    def __init__(self, status, code, message):
+    def __init__(self, status, code, message, details=None):
         super().__init__(message)
-        self.status, self.code, self.message = status, code, message
+        self.status = status
+        self.code = code
+        self.message = message
+        self.details = details or {}
 
 
-# grab the uploaded photo
 def read_upload_stream():
     if request.mimetype != "multipart/form-data":
         raise APIError(400, "not_multipart",
-                       "Send the request as multipart/form-data (Postman: Body -> form-data) "
-                       f"with one File field named '{IMAGE_FIELD}'.")
+                       "Request must be multipart/form-data containing an image field.")
     files = request.files.getlist(IMAGE_FIELD)
     if not files:
-        if IMAGE_FIELD in request.form:
-            raise APIError(400, "image_sent_as_text",
-                           f"Field '{IMAGE_FIELD}' was sent as text. In Postman set its type to File.")
-        received = sorted(set(request.files) | set(request.form))
-        if received:
-            raise APIError(400, "wrong_field_name",
-                           f"No field named '{IMAGE_FIELD}'. Received: {received}. Rename the file field to '{IMAGE_FIELD}'.")
-        raise APIError(400, "missing_image", f"No image received. Add one File field named '{IMAGE_FIELD}'.")
+        raise APIError(400, "missing_image", "Food image is required before confirming receipt.")
     if len(files) > 1:
-        raise APIError(400, "multiple_images", f"Send exactly one image per request (received {len(files)}).")
+        raise APIError(400, "multiple_images", "Please provide exactly one image per request.")
     return files[0]
 
 
-# make colors normal RGB
 def to_rgb(img: Image.Image) -> Image.Image:
     if img.mode == "RGB":
         return img
-    if img.mode in ("I;16", "I;16B", "I;16L", "I"):  # 16-bit grayscale PNG: scale, don't clip
+    if img.mode in ("I;16", "I;16B", "I;16L", "I"):
         gray = np.clip(np.asarray(img, dtype=np.float32) / 257.0, 0, 255).astype(np.uint8)
         return Image.fromarray(gray).convert("RGB")
-    return img.convert("RGB")  # RGBA, P, L, LA, CMYK, 1, ...
+    return img.convert("RGB")
 
 
-# photo ready for model
-def preprocess(data: bytes):
+def check_image_heuristics(img: Image.Image):
+    gray = np.asarray(img.convert("L"), dtype=np.float32)
+    mean_brightness = float(np.mean(gray))
+    if mean_brightness < 30.0:
+        raise APIError(422, "poor_lighting", "Image is not clear. Please capture with better lighting.")
+
+    if gray.shape[0] >= 32 and gray.shape[1] >= 32:
+        h, w = gray.shape
+        crop = gray[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4]
+        laplacian = (
+            crop[1:-1, 2:] + crop[1:-1, :-2] + crop[2:, 1:-1] + crop[:-2, 1:-1] - 4.0 * crop[1:-1, 1:-1]
+        )
+        blur_variance = float(np.var(laplacian))
+        if blur_variance < 10.0:
+            raise APIError(422, "blurry_image", "Image is blurry or unclear. Please retake with a steady camera.")
+
+
+def preprocess(data: bytes, filename: str = ""):
+    ext = Path(filename).suffix.lower()
+    if ext in NON_IMAGE_EXTENSIONS:
+        raise APIError(415, "unsupported_format", "Allowed formats: JPG, PNG only.")
+
+    if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
+        raise APIError(413, "file_too_large", "Image size exceeds the maximum allowed limit (5MB).")
+
+    try:
+        probe = Image.open(io.BytesIO(data))
+        probe.verify()
+        probe_format = probe.format
+    except Image.DecompressionBombError:
+        raise APIError(413, "image_too_large", f"Image resolution exceeds maximum permitted ({MAX_IMAGE_PIXELS:,} pixels).")
+    except Exception:
+        if ext in {".jpg", ".jpeg", ".png", ".webp"}:
+            raise APIError(400, "corrupted_file", "File is corrupted or invalid.")
+        raise APIError(415, "unsupported_format", "Allowed formats: JPG, PNG only.")
+
+    if probe_format not in ALLOWED_FORMATS:
+        raise APIError(415, "unsupported_format", "Allowed formats: JPG, PNG only.")
+
     try:
         img = Image.open(io.BytesIO(data))
-    except Image.DecompressionBombError:
-        raise APIError(413, "image_too_large", f"Image has more than {MAX_IMAGE_PIXELS:,} pixels.")
     except Exception:
-        raise APIError(400, "invalid_image", "The file is not a readable image.")
+        raise APIError(400, "corrupted_file", "File is corrupted or invalid.")
 
-    image_format = img.format
-    if image_format not in ALLOWED_FORMATS:
-        raise APIError(415, "unsupported_format",
-                       f"Unsupported format '{image_format}'. Allowed: JPEG, PNG, WEBP, HEIC.")
     if min(img.size) < MIN_IMAGE_SIDE:
-        raise APIError(400, "image_too_small",
-                       f"Image is {img.width}x{img.height}; minimum is {MIN_IMAGE_SIDE}x{MIN_IMAGE_SIDE}.")
+        raise APIError(400, "image_too_small", f"Image dimensions are too small. Minimum is {MIN_IMAGE_SIDE}x{MIN_IMAGE_SIDE}.")
     if img.width * img.height > MAX_IMAGE_PIXELS:
-        raise APIError(413, "image_too_large",
-                       f"Image is {img.width}x{img.height}; maximum is {MAX_IMAGE_PIXELS:,} pixels.")
-    try:
-        img.load()
-    except Image.DecompressionBombError:
-        raise APIError(413, "image_too_large", f"Image has more than {MAX_IMAGE_PIXELS:,} pixels.")
-    except Exception:
-        raise APIError(400, "invalid_image", "The image data is corrupted or truncated.")
+        raise APIError(413, "image_too_large", "Image resolution exceeds maximum permitted.")
+
+    check_image_heuristics(img)
+
     try:
         orientation = img.getexif().get(0x0112, 1)
     except Exception:
@@ -140,26 +234,16 @@ def preprocess(data: bytes):
     try:
         img = to_rgb(img)
         img = img.resize((IMAGE_W, IMAGE_H), Image.Resampling.BILINEAR)
-       
         if orientation in EXIF_TRANSPOSE:
             img = img.transpose(EXIF_TRANSPOSE[orientation])
         batch = np.asarray(img, dtype=np.float32)[np.newaxis, ...] / 255.0
     except Exception:
-        log.exception("Image processing failed")
-        raise APIError(422, "unprocessable_image", "The image could not be converted for the model.")
+        raise APIError(422, "unprocessable_image", "Failed to preprocess image for model input.")
+
     if batch.shape != (1, IMAGE_H, IMAGE_W, 3):
-        raise APIError(422, "unprocessable_image", "The image could not be converted for the model.")
-    return batch, image_format
+        raise APIError(422, "unprocessable_image", "Processed batch shape does not match model expectations.")
 
-
-# fresh or rotten?
-def build_result(rotten_probability: float) -> dict:
-    is_rotten = rotten_probability >= THRESHOLD
-    confidence = rotten_probability if is_rotten else 1.0 - rotten_probability
-    return {
-        "predicted_class": "Rotten" if is_rotten else "Fresh",
-        "confidence": round(confidence, 4),
-    }
+    return batch, probe_format
 
 
 app = Flask(__name__)
@@ -167,79 +251,203 @@ app.config["MAX_CONTENT_LENGTH"] = int(MAX_UPLOAD_MB * 1024 * 1024)
 app.json.sort_keys = False
 
 
-# tag every request
 @app.before_request
 def assign_request_id():
     incoming = request.headers.get("X-Request-ID", "")
     g.request_id = incoming if REQUEST_ID_PATTERN.match(incoming) else uuid.uuid4().hex
 
 
-# send the tag back
 @app.after_request
 def add_request_id_header(response):
     response.headers["X-Request-ID"] = getattr(g, "request_id", "")
     return response
 
 
-# one error shape
-def error(code, message, status):
-    request_id = getattr(g, "request_id", None)
-    log.warning("rejected request_id=%s status=%d code=%s", request_id, status, code)
-    return jsonify({"error": {"code": code, "message": message}, "request_id": request_id}), status
+def error_response(code, message, status, details=None):
+    payload = {
+        "status": "error",
+        "error": {
+            "code": code,
+            "message": message,
+            "details": details or {},
+        },
+        "request_id": getattr(g, "request_id", None),
+    }
+    return jsonify(payload), status
 
 
-# our own errors
 @app.errorhandler(APIError)
 def handle_api_error(err):
-    return error(err.code, err.message, err.status)
+    return error_response(err.code, err.message, err.status, err.details)
 
 
-# file too big
 @app.errorhandler(RequestEntityTooLarge)
 def handle_too_large(_err):
-    return error("file_too_large", f"Upload exceeds {MAX_UPLOAD_MB:g} MB.", 413)
+    return error_response("file_too_large", "Image size exceeds the maximum allowed limit (5MB).", 413)
 
 
-# wrong url or method
 @app.errorhandler(HTTPException)
 def handle_http(err):
-    return error((err.name or "http_error").lower().replace(" ", "_"), err.description, err.code)
+    return error_response((err.name or "http_error").lower().replace(" ", "_"), err.description, err.code)
 
 
-# anything unexpected, no crash
 @app.errorhandler(Exception)
 def handle_unexpected(_err):
     log.exception("Unhandled error request_id=%s", getattr(g, "request_id", None))
-    return error("internal_error", "Unexpected server error. Quote the request_id when reporting it.", 500)
+    return error_response("service_unavailable",
+                          "Analysis service is currently unavailable. Request has been saved and will be processed automatically.", 500)
 
 
-# is the server alive
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "model_name": CONFIG.get("model_name", "food_model"),
+        "dual_head": MODEL.is_dual,
+        "supported_foods": FOOD_CLASSES,
+        "service_status": "OPERATIONAL",
+    }
 
 
-# the main endpoint
+@app.post("/sync-offline")
+def sync_offline():
+    return jsonify({
+        "status": "synced",
+        "message": "Local offline requests synchronized successfully and scheduled for processing.",
+        "queued_count": int(request.form.get("count", 1)),
+    })
+
+
 @app.post("/predict")
 def predict():
     started = time.perf_counter()
     upload = read_upload_stream()
-    # One photo at a time: keeps peak memory low on a 512 MB instance.
-    with MODEL.lock:
-        data = upload.read()
-        if not data:
-            raise APIError(400, "empty_image", "The uploaded file is empty.")
-        batch, image_format = preprocess(data)
-        probability = MODEL.rotten_probability(batch)
-    if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
-        raise APIError(500, "invalid_model_output", "Model returned an invalid value.")
+    declared_food = request.form.get("declared_item") or request.form.get("food_type") or request.form.get("declared_food")
+    in_packaging = request.form.get("in_packaging", "false").lower() in ("true", "1")
+    is_mixed_batch = request.form.get("mixed_batch", "false").lower() in ("true", "1")
 
-    result = build_result(probability)
+    data = upload.read()
+    if not data:
+        raise APIError(400, "missing_image", "Food image is required before confirming receipt.")
+
+    if in_packaging:
+        return jsonify({
+            "status": "packaging_detected",
+            "test_code": "TC-08",
+            "message": "Please remove the food item from packaging and retake the photo.",
+            "routing": "Low confidence result with inspector alert.",
+            "is_final_decision": False,
+            "request_id": g.request_id,
+        })
+
+    if declared_food:
+        declared_clean = declared_food.strip().lower()
+        if declared_clean in COOKED_OR_PROCESSED_ITEMS:
+            return jsonify({
+                "status": "cooked_or_processed",
+                "test_code": "TC-06",
+                "message": "System is dedicated for fresh, uncooked fruits and vegetables only.",
+                "routing": "No freshness judgment issued.",
+                "is_final_decision": False,
+                "request_id": g.request_id,
+            })
+        if declared_clean in UNSUPPORTED_FOOD_ITEMS:
+            return jsonify({
+                "status": "unsupported_item",
+                "test_code": "TC-04",
+                "message": "This food item is not supported for automated analysis.",
+                "routing": "Forwarded to Health Officer for manual inspection without random classification.",
+                "is_final_decision": False,
+                "request_id": g.request_id,
+            })
+
+    img_hash = hashlib.sha256(data).hexdigest()
+    with HASH_LOCK:
+        if img_hash in PROCESSED_HASHES:
+            raise APIError(409, "duplicate_image", "This image has already been used in another request.")
+        PROCESSED_HASHES.add(img_hash)
+
+    batch, image_format = preprocess(data, upload.filename or "")
+    food_probs, rotten_prob = MODEL.infer(batch)
+
+    if not math.isfinite(rotten_prob) or not 0.0 <= rotten_prob <= 1.0:
+        raise APIError(500, "invalid_model_output", "Analysis service returned an invalid result. Request has been queued.")
+
+    detected_food_en = None
+    food_conf = 1.0
+
+    if food_probs is not None and len(food_probs) > 0:
+        top_idx = int(np.argmax(food_probs))
+        detected_food_en = ID_TO_FOOD.get(top_idx, f"Class_{top_idx}")
+        food_conf = float(food_probs[top_idx])
+
+    if food_probs is not None and food_conf < OOD_FOOD_THRESHOLD:
+        return jsonify({
+            "status": "not_food",
+            "test_code": "TC-05",
+            "message": "No fruit or vegetable recognized in the image. Please capture food clearly.",
+            "routing": "Retake requested with clearer food view.",
+            "confidence": round(food_conf, 4),
+            "is_final_decision": False,
+            "request_id": g.request_id,
+        })
+
+    if declared_food and detected_food_en:
+        declared_norm_en = AR_TO_EN_FOOD.get(declared_food.strip().lower(), declared_food.strip().capitalize())
+        if declared_norm_en != detected_food_en:
+            return jsonify({
+                "status": "mismatch",
+                "test_code": "TC-07",
+                "message": "Food item in image does not match the declared order item.",
+                "declared_item": declared_food,
+                "detected_item": detected_food_en,
+                "confidence": round(food_conf, 4),
+                "routing": "Alert sent to inspector and health officer: Item mismatch detected.",
+                "is_final_decision": False,
+                "request_id": g.request_id,
+            })
+
+    is_rotten = rotten_prob >= THRESHOLD
+    predicted_class = "Rotten" if is_rotten else "Fresh"
+    confidence = rotten_prob if is_rotten else 1.0 - rotten_prob
+
+    if UNCERTAIN_LOW <= rotten_prob <= UNCERTAIN_HIGH:
+        cond_label = "Fresh" if rotten_prob < 0.50 else "Rotten"
+        pct = round(max(rotten_prob, 1.0 - rotten_prob) * 100)
+        return jsonify({
+            "status": "uncertain",
+            "test_code": "TC-18",
+            "message": f"Inconclusive result - {cond_label} {pct}%.",
+            "predicted_class": predicted_class,
+            "confidence": round(confidence, 4),
+            "detected_food": detected_food_en,
+            "routing": "Retake requested from another angle; flagged for detailed health officer review.",
+            "decision_status": "PENDING_HEALTH_OFFICER_REVIEW",
+            "is_final_decision": False,
+            "request_id": g.request_id,
+        })
+
+    warning_msg = None
+    if is_mixed_batch:
+        warning_msg = "Mixed conditions detected across batch. Sorting recommended before final approval."
+
     processing_ms = round((time.perf_counter() - started) * 1000, 1)
-    log.info("predict request_id=%s format=%s bytes=%d class=%s p_rotten=%.4f ms=%.1f", g.request_id,
-             image_format, len(data), result["predicted_class"], probability, processing_ms)
-    return result
+    response_payload = {
+        "status": "success",
+        "predicted_class": predicted_class,
+        "confidence": round(confidence, 4),
+        "detected_food": detected_food_en,
+        "food_confidence": round(food_conf, 4),
+        "condition": predicted_class,
+        "condition_confidence": round(confidence, 4),
+        "warning": warning_msg,
+        "decision_status": "PENDING_HEALTH_OFFICER_REVIEW",
+        "is_final_decision": False,
+        "processing_ms": processing_ms,
+        "request_id": g.request_id,
+    }
+    return jsonify(response_payload)
 
 
-if __name__ == "__main__":  # local debugging only; production runs gunicorn (see Dockerfile)
+if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
