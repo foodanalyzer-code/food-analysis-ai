@@ -461,16 +461,11 @@ def predict():
             "message": f"Inconclusive result - {cond_label} {pct}%.",
             "predicted_class": predicted_class,
             "confidence": round(confidence, 4),
-            "detected_food": detected_food_en,
         })
 
     response_payload = {
         "predicted_class": predicted_class,
         "confidence": round(confidence, 4),
-        "detected_food": detected_food_en,
-        "food_confidence": round(food_conf, 4),
-        "condition": predicted_class,
-        "condition_confidence": round(confidence, 4),
     }
     if is_mixed_batch:
         response_payload["warning"] = "Mixed conditions detected across batch. Sorting recommended before final approval."
