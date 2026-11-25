@@ -271,7 +271,6 @@ def error_response(code, message, status, details=None):
             "message": message,
             "details": details or {},
         },
-        "request_id": getattr(g, "request_id", None),
     }
     return jsonify(payload), status
 
@@ -333,11 +332,8 @@ def predict():
     if in_packaging:
         return jsonify({
             "status": "packaging_detected",
-            "test_code": "TC-08",
             "message": "Please remove the food item from packaging and retake the photo.",
-            "routing": "Low confidence result with inspector alert.",
             "is_final_decision": False,
-            "request_id": g.request_id,
         })
 
     if declared_food:
@@ -345,20 +341,14 @@ def predict():
         if declared_clean in COOKED_OR_PROCESSED_ITEMS:
             return jsonify({
                 "status": "cooked_or_processed",
-                "test_code": "TC-06",
                 "message": "System is dedicated for fresh, uncooked fruits and vegetables only.",
-                "routing": "No freshness judgment issued.",
                 "is_final_decision": False,
-                "request_id": g.request_id,
             })
         if declared_clean in UNSUPPORTED_FOOD_ITEMS:
             return jsonify({
                 "status": "unsupported_item",
-                "test_code": "TC-04",
                 "message": "This food item is not supported for automated analysis.",
-                "routing": "Forwarded to Health Officer for manual inspection without random classification.",
                 "is_final_decision": False,
-                "request_id": g.request_id,
             })
 
     img_hash = hashlib.sha256(data).hexdigest()
@@ -384,12 +374,9 @@ def predict():
     if food_probs is not None and food_conf < OOD_FOOD_THRESHOLD:
         return jsonify({
             "status": "not_food",
-            "test_code": "TC-05",
             "message": "No fruit or vegetable recognized in the image. Please capture food clearly.",
-            "routing": "Retake requested with clearer food view.",
             "confidence": round(food_conf, 4),
             "is_final_decision": False,
-            "request_id": g.request_id,
         })
 
     if declared_food and detected_food_en:
@@ -397,14 +384,11 @@ def predict():
         if declared_norm_en != detected_food_en:
             return jsonify({
                 "status": "mismatch",
-                "test_code": "TC-07",
                 "message": "Food item in image does not match the declared order item.",
                 "declared_item": declared_food,
                 "detected_item": detected_food_en,
                 "confidence": round(food_conf, 4),
-                "routing": "Alert sent to inspector and health officer: Item mismatch detected.",
                 "is_final_decision": False,
-                "request_id": g.request_id,
             })
 
     is_rotten = rotten_prob >= THRESHOLD
@@ -416,15 +400,12 @@ def predict():
         pct = round(max(rotten_prob, 1.0 - rotten_prob) * 100)
         return jsonify({
             "status": "uncertain",
-            "test_code": "TC-18",
             "message": f"Inconclusive result - {cond_label} {pct}%.",
             "predicted_class": predicted_class,
             "confidence": round(confidence, 4),
             "detected_food": detected_food_en,
-            "routing": "Retake requested from another angle; flagged for detailed health officer review.",
             "decision_status": "PENDING_HEALTH_OFFICER_REVIEW",
             "is_final_decision": False,
-            "request_id": g.request_id,
         })
 
     warning_msg = None
@@ -444,7 +425,6 @@ def predict():
         "decision_status": "PENDING_HEALTH_OFFICER_REVIEW",
         "is_final_decision": False,
         "processing_ms": processing_ms,
-        "request_id": g.request_id,
     }
     return jsonify(response_payload)
 
