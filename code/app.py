@@ -156,8 +156,7 @@ class APIError(Exception):
 
 def read_upload_stream():
     if request.mimetype != "multipart/form-data":
-        raise APIError(400, "not_multipart",
-                       "Request must be multipart/form-data containing an image field.")
+        raise APIError(400, "missing_image", "Food image is required before confirming receipt.")
     files = request.files.getlist(IMAGE_FIELD)
     if not files:
         raise APIError(400, "missing_image", "Food image is required before confirming receipt.")
@@ -264,15 +263,10 @@ def add_request_id_header(response):
 
 
 def error_response(code, message, status, details=None):
-    payload = {
-        "status": "error",
-        "error": {
-            "code": code,
-            "message": message,
-            "details": details or {},
-        },
-    }
-    return jsonify(payload), status
+    return jsonify({
+        "code": code,
+        "message": message,
+    }), status
 
 
 @app.errorhandler(APIError)
@@ -331,24 +325,21 @@ def predict():
 
     if in_packaging:
         return jsonify({
-            "status": "packaging_detected",
+            "code": "packaging_detected",
             "message": "Please remove the food item from packaging and retake the photo.",
-            "is_final_decision": False,
         })
 
     if declared_food:
         declared_clean = declared_food.strip().lower()
         if declared_clean in COOKED_OR_PROCESSED_ITEMS:
             return jsonify({
-                "status": "cooked_or_processed",
+                "code": "cooked_or_processed",
                 "message": "System is dedicated for fresh, uncooked fruits and vegetables only.",
-                "is_final_decision": False,
             })
         if declared_clean in UNSUPPORTED_FOOD_ITEMS:
             return jsonify({
-                "status": "unsupported_item",
+                "code": "unsupported_item",
                 "message": "This food item is not supported for automated analysis.",
-                "is_final_decision": False,
             })
 
     img_hash = hashlib.sha256(data).hexdigest()
@@ -373,22 +364,20 @@ def predict():
 
     if food_probs is not None and food_conf < OOD_FOOD_THRESHOLD:
         return jsonify({
-            "status": "not_food",
+            "code": "not_food",
             "message": "No fruit or vegetable recognized in the image. Please capture food clearly.",
             "confidence": round(food_conf, 4),
-            "is_final_decision": False,
         })
 
     if declared_food and detected_food_en:
         declared_norm_en = AR_TO_EN_FOOD.get(declared_food.strip().lower(), declared_food.strip().capitalize())
         if declared_norm_en != detected_food_en:
             return jsonify({
-                "status": "mismatch",
+                "code": "mismatch",
                 "message": "Food item in image does not match the declared order item.",
                 "declared_item": declared_food,
                 "detected_item": detected_food_en,
                 "confidence": round(food_conf, 4),
-                "is_final_decision": False,
             })
 
     is_rotten = rotten_prob >= THRESHOLD
@@ -399,13 +388,11 @@ def predict():
         cond_label = "Fresh" if rotten_prob < 0.50 else "Rotten"
         pct = round(max(rotten_prob, 1.0 - rotten_prob) * 100)
         return jsonify({
-            "status": "uncertain",
+            "code": "uncertain",
             "message": f"Inconclusive result - {cond_label} {pct}%.",
             "predicted_class": predicted_class,
             "confidence": round(confidence, 4),
             "detected_food": detected_food_en,
-            "decision_status": "PENDING_HEALTH_OFFICER_REVIEW",
-            "is_final_decision": False,
         })
 
     response_payload = {
