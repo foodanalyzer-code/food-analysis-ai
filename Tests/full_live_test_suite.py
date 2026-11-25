@@ -162,7 +162,7 @@ record("TC-20", "Mixed batch conditions", "Mixed crate", "MEDIUM", "Sorting warn
 PROCESSED_HASHES.clear()
 res21 = client.post("/predict", data={"image": (io.BytesIO(real_tomato_bytes), "tomato.jpg")}, content_type="multipart/form-data")
 j21 = res21.get_json() or {}
-record("TC-21", "10-class prediction output", "Real Tomato image", "CRITICAL", "Tomato Fresh", f"{j21.get('detected_food')} - {j21.get('predicted_class')}", j21.get("detected_food") == "Tomato")
+record("TC-21", "Freshness prediction output", "Real Tomato image", "CRITICAL", "Fresh with confidence", f"{j21.get('predicted_class')} ({j21.get('confidence')})", j21.get("predicted_class") == "Fresh" and "confidence" in j21)
 
 print("\n" + "=" * 125)
 print(f"{'TC ID':<7} | {'Scenario':<30} | {'Input':<32} | {'Priority':<8} | {'Status':<6} | {'Actual Response'}")
