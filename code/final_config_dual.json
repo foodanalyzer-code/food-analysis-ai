@@ -14,16 +14,26 @@
   "food_classes": [
     "Apple",
     "Banana",
+    "Bellpepper",
+    "Carrot",
+    "Cucumber",
     "Mango",
     "Orange",
-    "Strawberry"
+    "Potato",
+    "Strawberry",
+    "Tomato"
   ],
   "food_to_id": {
     "Apple": 0,
     "Banana": 1,
-    "Mango": 2,
-    "Orange": 3,
-    "Strawberry": 4
+    "Bellpepper": 2,
+    "Carrot": 3,
+    "Cucumber": 4,
+    "Mango": 5,
+    "Orange": 6,
+    "Potato": 7,
+    "Strawberry": 8,
+    "Tomato": 9
   },
   "condition_classes": [
     "Fresh",
