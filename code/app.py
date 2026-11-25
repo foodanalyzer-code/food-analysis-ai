@@ -408,24 +408,16 @@ def predict():
             "is_final_decision": False,
         })
 
-    warning_msg = None
-    if is_mixed_batch:
-        warning_msg = "Mixed conditions detected across batch. Sorting recommended before final approval."
-
-    processing_ms = round((time.perf_counter() - started) * 1000, 1)
     response_payload = {
-        "status": "success",
         "predicted_class": predicted_class,
         "confidence": round(confidence, 4),
         "detected_food": detected_food_en,
         "food_confidence": round(food_conf, 4),
         "condition": predicted_class,
         "condition_confidence": round(confidence, 4),
-        "warning": warning_msg,
-        "decision_status": "PENDING_HEALTH_OFFICER_REVIEW",
-        "is_final_decision": False,
-        "processing_ms": processing_ms,
     }
+    if is_mixed_batch:
+        response_payload["warning"] = "Mixed conditions detected across batch. Sorting recommended before final approval."
     return jsonify(response_payload)
 
 
